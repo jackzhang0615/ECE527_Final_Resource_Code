@@ -1,0 +1,301 @@
+from pynq import Overlay, allocate
+import numpy as np
+import time
+import threading
+
+BITFILE_PATH = "/home/xilinx/jupyter_notebooks/GEMM_project/gemm_design_wrapper_2048.xsa"
+
+ol = Overlay(BITFILE_PATH)
+print("Overlay loaded:", ol.is_loaded())
+print("IPs:", list(ol.ip_dict.keys()))
+
+accel = ol.gemm_accel_0
+print(accel.register_map)
+
+M = 1024
+K = 1024
+N = 1024
+
+
+A = allocate(shape=(M, K), dtype=np.float32)
+B = allocate(shape=(K, N), dtype=np.float32)
+C_full = allocate(shape=(M, N), dtype=np.float32)  
+
+
+np.random.seed(0)
+A[:] = np.random.randn(M, K).astype(np.float32)
+B[:] = np.random.randn(K, N).astype(np.float32)
+
+A.flush()
+B.flush()
+
+
+t0 = time.time()
+A_np = np.array(A)       
+B_np = np.array(B)
+C_ref = A_np @ B_np
+t1 = time.time()
+
+cpu_full_time = t1 - t0
+print("CPU full GEMM (A@B) time: %.4f s" % cpu_full_time)
+print("C_ref shape:", C_ref.shape)
+
+def fpga_gemm_full():
+    """Run GEMM accelerator on all rows [0:M) into C_full."""
+    rm = accel.register_map
+
+ 
+    addrA = int(A.device_address)
+    addrB = int(B.device_address)
+    addrC = int(C_full.device_address)
+
+    rm.A_1 = addrA & 0xFFFFFFFF
+    rm.A_2 = addrA >> 32
+    rm.B_1 = addrB & 0xFFFFFFFF
+    rm.B_2 = addrB >> 32
+    rm.C_1 = addrC & 0xFFFFFFFF
+    rm.C_2 = addrC >> 32
+
+    
+    rm.M = M
+    rm.N = N
+    rm.K = K
+    rm.row_start = 0
+    rm.row_count = M
+
+    C_full[:] = 0.0
+    C_full.flush()
+    A.flush()
+    B.flush()
+
+ 
+    accel.write(0x00, 0x1)
+    t0 = time.time()
+    while (accel.read(0x00) & 0x2) == 0:
+        pass
+    t1 = time.time()
+
+    C_full.invalidate()
+    return t1 - t0
+
+fpga_full_time = fpga_gemm_full()
+C_hw_full = np.array(C_full)
+
+max_err_full = float(np.max(np.abs(C_hw_full - C_ref)))
+print("FPGA full GEMM time: %.4f s" % fpga_full_time)
+print("Max |C_hw_full - C_ref| = %.3e" % max_err_full)
+
+
+C_fpga = allocate(shape=(M, N), dtype=np.float32)
+
+
+C_cpu = np.zeros((M, N), dtype=np.float32)
+
+
+def fpga_gemm_partial_into(C_buf, row_start, row_count):
+    """
+    Run accelerator on rows [row_start, row_start+row_count) into C_buf.
+    C_buf must be a Pynq allocate() buffer of shape (M, N).
+    """
+    if row_count <= 0:
+        return
+
+    rm = accel.register_map
+
+    addrA = int(A.device_address)
+    addrB = int(B.device_address)
+    addrC = int(C_buf.device_address)
+
+
+    rm.A_1 = addrA & 0xFFFFFFFF
+    rm.A_2 = addrA >> 32
+    rm.B_1 = addrB & 0xFFFFFFFF
+    rm.B_2 = addrB >> 32
+    rm.C_1 = addrC & 0xFFFFFFFF
+    rm.C_2 = addrC >> 32
+
+  
+    rm.M = M
+    rm.N = N
+    rm.K = K
+    rm.row_start = int(row_start)
+    rm.row_count = int(row_count)
+
+    
+    A.flush()
+    B.flush()
+    C_buf.flush()
+
+    
+    accel.write(0x00, 0x1)
+    while (accel.read(0x00) & 0x2) == 0:
+        pass
+
+    
+    C_buf.invalidate()
+
+def cpu_gemm_partial_into(C_cpu_buf, row_start, row_end):
+    """
+    CPU computes rows [row_start, row_end) of C into C_cpu_buf,
+    using A_np @ B_np (standard GEMM).
+    """
+    if row_end <= row_start:
+        return
+    C_cpu_buf[row_start:row_end, :] = A_np[row_start:row_end, :] @ B_np
+
+def run_static_alpha_parallel(alpha: float):
+ 
+    row_fpga      = int(alpha * M)
+    row_cpu_start = row_fpga
+    row_cpu_end   = M
+
+   
+    C_fpga[:] = 0.0
+    C_fpga.flush()
+    C_cpu[:]  = 0.0
+
+    def fpga_task():
+        fpga_gemm_partial_into(C_fpga, 0, row_fpga)
+
+    def cpu_task():
+        cpu_gemm_partial_into(C_cpu, row_cpu_start, row_cpu_end)
+
+    threads = []
+
+    if row_fpga > 0:
+        threads.append(threading.Thread(target=fpga_task))
+    if row_cpu_start < row_cpu_end:
+        threads.append(threading.Thread(target=cpu_task))
+
+
+    t0 = time.time()
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    t1 = time.time()
+
+    total_time = t1 - t0
+
+    C_combined = np.zeros((M, N), dtype=np.float32)
+
+    if row_fpga > 0:
+        C_fpga_np = np.array(C_fpga)
+        C_combined[0:row_fpga, :] = C_fpga_np[0:row_fpga, :]
+
+    if row_cpu_start < row_cpu_end:
+        C_combined[row_cpu_start:row_cpu_end, :] = C_cpu[row_cpu_start:row_cpu_end, :]
+
+    max_err = float(np.max(np.abs(C_combined - C_ref)))
+    return total_time, max_err
+
+print("\nStatic alpha sweep with parallel CPU+FPGA:")
+for alpha in np.linspace(0.0, 1.0, 11):
+    t, err = run_static_alpha_parallel(alpha)
+    print(f"  alpha = {alpha:0.1f} -> time = {t:0.4f} s, max_err = {err:0.3e}")
+
+print("\nReference times:")
+print("  Pure CPU (full A@B)   :", cpu_full_time)
+print("  Pure FPGA (full GEMM) :", fpga_full_time)
+
+
+def measure_cpu_full_rows():
+   
+    C_tmp = np.zeros((M, N), dtype=np.float32)
+    t0 = time.time()
+    cpu_gemm_partial_into(C_tmp, 0, M)
+    t1 = time.time()
+    return t1 - t0
+
+def measure_fpga_full_rows():
+  
+    C_fpga[:] = 0.0
+    C_fpga.flush()
+    t0 = time.time()
+    fpga_gemm_partial_into(C_fpga, 0, M)
+    t1 = time.time()
+    return t1 - t0
+
+cpu_full_dyn  = measure_cpu_full_rows()
+fpga_full_dyn = measure_fpga_full_rows()
+
+print("Dynamic calibration (using partial helpers):")
+print("  CPU full rows time  : %.6f s" % cpu_full_dyn)
+print("  FPGA full rows time : %.6f s" % fpga_full_dyn)
+
+
+alpha_star = cpu_full_dyn / (cpu_full_dyn + fpga_full_dyn)
+alpha_star = float(np.clip(alpha_star, 0.0, 1.0))
+
+print("  alpha* (ideal FPGA row fraction) = %.3f" % alpha_star)
+
+row_fpga_star = int(round(alpha_star * M))
+print("  => FPGA rows: %d, CPU rows: %d" % (row_fpga_star, M - row_fpga_star))
+
+
+dyn_time, dyn_err = run_static_alpha_parallel(alpha_star)
+
+print("\nDynamic alpha* parallel run:")
+print("  alpha*     = %.3f" % alpha_star)
+print("  total time = %.6f s" % dyn_time)
+print("  max_err    = %.3e" % dyn_err)
+
+print("\nCompare to full runs (from dynamic calibration):")
+print("  CPU full (dyn-calibrated)  : %.6f s" % cpu_full_dyn)
+print("  FPGA full (dyn-calibrated) : %.6f s" % fpga_full_dyn)
+
+
+NUM_SAMPLE_ROWS   = 50     
+SAMPLE_ROW_START  = 0       
+SAMPLE_ROW_END    = SAMPLE_ROW_START + NUM_SAMPLE_ROWS
+
+assert SAMPLE_ROW_END <= M, "Sample range exceeds matrix size"
+
+def measure_cpu_sample_rows(row_start, row_end):
+   
+    C_tmp = np.zeros((M, N), dtype=np.float32)
+    t0 = time.time()
+    cpu_gemm_partial_into(C_tmp, row_start, row_end)
+    t1 = time.time()
+    return t1 - t0
+
+def measure_fpga_sample_rows(row_start, row_end):
+   
+    C_fpga[:] = 0.0
+    C_fpga.flush()
+    t0 = time.time()
+    fpga_gemm_partial_into(C_fpga, row_start, row_end - row_start)
+    t1 = time.time()
+    return t1 - t0
+
+t_cpu_10  = measure_cpu_sample_rows(SAMPLE_ROW_START, SAMPLE_ROW_END)
+t_fpga_10 = measure_fpga_sample_rows(SAMPLE_ROW_START, SAMPLE_ROW_END)
+
+
+t_cpu_row  = t_cpu_10  / NUM_SAMPLE_ROWS
+t_fpga_row = t_fpga_10 / NUM_SAMPLE_ROWS
+
+alpha_10 = t_cpu_10 / (t_cpu_10 + t_fpga_10) if (t_cpu_10 + t_fpga_10) > 0 else 0.0
+alpha_10 = float(np.clip(alpha_10, 0.0, 1.0))
+
+row_fpga_10 = int(round(alpha_10 * M))
+
+print("\nDynamic alpha based on TOP-10 rows (rows %d..%d):"
+      % (SAMPLE_ROW_START, SAMPLE_ROW_END-1))
+print("  t_cpu_10rows  ≈ %.6e s  (per row ≈ %.6e s)" % (t_cpu_10,  t_cpu_row))
+print("  t_fpga_10rows ≈ %.6e s  (per row ≈ %.6e s)" % (t_fpga_10, t_fpga_row))
+print("  alpha_10 ≈ %.3f -> row_fpga ≈ %d (of %d)" % (alpha_10, row_fpga_10, M))
+
+
+dyn10_time, dyn10_err = run_static_alpha_parallel(alpha_10)
+
+print("\nDynamic TOP-10 alpha run (contiguous split):")
+print("  alpha_10   = %.3f" % alpha_10)
+print("  total time = %.6f s" % dyn10_time)
+print("  max_err    = %.3e" % dyn10_err)
+
+try:
+    print("\nFor comparison:")
+    print("  Full-run alpha* = %.3f" % alpha_star)
+except NameError:
+    pass

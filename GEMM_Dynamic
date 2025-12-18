@@ -1,0 +1,448 @@
+# 1024*1024 martix script
+# irregularity applied with pattern from 0 - 10,000. (2000, 5000, 7000, 10000)
+# 1 row - optimal alpha estimated worng
+# 100 rows (10% of 1024) - optinal alpha estimated close to all rows. 
+# task-pool dynamic sheme does not show improvement. 
+
+from pynq import Overlay, allocate
+import numpy as np
+import time, threading
+
+
+BITFILE_PATH = "/home/xilinx/jupyter_notebooks/GEMM_project/gemm_design_wrapper_2048.xsa"
+
+ol = Overlay(BITFILE_PATH)
+print("Overlay loaded:", ol.is_loaded())
+print("IPs:", list(ol.ip_dict.keys()))
+
+accel = ol.gemm_accel_0
+print("Register map:")
+print(accel.register_map)
+
+
+M = 1024
+K = 1024
+N = 1024
+
+# FPGA buffers
+A_buf    = allocate(shape=(M, K), dtype=np.float32)
+B_buf    = allocate(shape=(K, N), dtype=np.float32)
+C_buf    = allocate(shape=(M, N), dtype=np.float32)  
+work_buf = allocate(shape=(M,),   dtype=np.int32)    
+
+
+np.random.seed(0)
+A_buf[:] = np.random.randn(M, K).astype(np.float32)
+B_buf[:] = np.random.randn(K, N).astype(np.float32)
+A_buf.flush()
+B_buf.flush()
+
+A_np = np.array(A_buf)
+B_np = np.array(B_buf)
+
+
+t0 = time.time()
+C_ref = A_np @ B_np
+t1 = time.time()
+cpu_baseline_time = t1 - t0
+print(f"\nCPU pure A@B baseline time: {cpu_baseline_time:.6f} s")
+print("C_ref shape:", C_ref.shape)
+
+
+assert M == 1024, "This random work pattern assumes M = 512."
+
+work = np.zeros(M, dtype=np.int32)
+work[0:127]     = 2000
+work[128:500]   = 5000
+work[501:700]   = 7000
+work[701:1000]   = 10000
+
+work_buf[:] = work
+work_buf.flush()
+
+print("\nCheck work[] pattern by region:")
+print("  rows   0–15  :", work[0:16])
+print("  rows 120–135:", work[120:136])
+print("  rows 248–263:", work[248:264])
+print("  rows 376–391:", work[376:392])
+print("  rows 496–511:", work[496:512])
+
+CPU_WEIGHT_SCALE = 1.0  
+
+
+def set_ptr64(rm, base_name, addr):
+    """
+    Write a 64-bit device address into AXI-Lite registers.
+    Works with patterns like A_1/A_2, B_1/B_2, C_1/C_2, work_1/work_2.
+    """
+    addr = int(addr)
+    lo = addr & 0xFFFFFFFF
+    hi = addr >> 32
+
+    lo_name = base_name + "_1"
+    hi_name = base_name + "_2"
+
+    if hasattr(rm, lo_name) and hasattr(rm, hi_name):
+        setattr(rm, lo_name, lo)
+        setattr(rm, hi_name, hi)
+    elif hasattr(rm, base_name):
+        setattr(rm, base_name, lo)
+    else:
+        raise AttributeError(f"RegisterMap has no fields for base_name='{base_name}'")
+
+
+def fpga_gemm_full():
+    """
+    Run gemm_accel on all rows [0:M) with the current work[] pattern.
+    Writes into C_buf.
+    Returns elapsed time (s).
+    """
+    rm = accel.register_map
+
+    set_ptr64(rm, "A",    A_buf.device_address)
+    set_ptr64(rm, "B",    B_buf.device_address)
+    set_ptr64(rm, "C",    C_buf.device_address)
+    set_ptr64(rm, "work", work_buf.device_address)
+
+    rm.M = M
+    rm.N = N
+    rm.K = K
+    rm.row_start = 0
+    rm.row_count = M
+
+    C_buf[:] = 0.0
+    C_buf.flush()
+    A_buf.flush()
+    B_buf.flush()
+    work_buf.flush()
+
+    accel.write(0x00, 0x1)   
+    t0 = time.time()
+    while (accel.read(0x00) & 0x2) == 0:  
+        pass
+    t1 = time.time()
+
+    C_buf.invalidate()
+    return t1 - t0
+
+fpga_time_full = fpga_gemm_full()
+C_fpga_full = np.array(C_buf)
+max_err_full = float(np.max(np.abs(C_fpga_full - C_ref)))
+print(f"\nFull FPGA GEMM time (with work[]): {fpga_time_full:.6f} s, "
+      f"max |C_fpga - C_ref| = {max_err_full:.3e}")
+
+
+C_cpu      = np.zeros((M, N), dtype=np.float32)  
+C_combined = np.zeros((M, N), dtype=np.float32)  
+
+def fpga_gemm_partial(row_start, row_count):
+    """
+    Run gemm_accel on a row range [row_start, row_start+row_count).
+    Writes into C_buf.
+    Returns elapsed time (s).
+    """
+    if row_count <= 0:
+        return 0.0
+
+    rm = accel.register_map
+
+    set_ptr64(rm, "A",    A_buf.device_address)
+    set_ptr64(rm, "B",    B_buf.device_address)
+    set_ptr64(rm, "C",    C_buf.device_address)
+    set_ptr64(rm, "work", work_buf.device_address)
+
+    rm.M = M
+    rm.N = N
+    rm.K = K
+    rm.row_start = int(row_start)
+    rm.row_count = int(row_count)
+
+    A_buf.flush()
+    B_buf.flush()
+    work_buf.flush()
+    C_buf.flush()
+
+    accel.write(0x00, 0x1)
+    t0 = time.time()
+    while (accel.read(0x00) & 0x2) == 0:
+        pass
+    t1 = time.time()
+
+    C_buf.invalidate()
+    return t1 - t0
+
+def cpu_gemm_partial_rows(C_dest, row_start, row_end):
+    """
+    CPU computes rows [row_start, row_end) of C using A@B
+    AND does dummy work per row based on work[i].
+    Returns elapsed time (s).
+    """
+    if row_end <= row_start:
+        return 0.0
+
+    t0 = time.time()
+
+   
+    C_dest[row_start:row_end, :] = A_np[row_start:row_end, :] @ B_np
+
+
+    for i in range(row_start, row_end):
+        w = int(work[i] * CPU_WEIGHT_SCALE)
+        for _ in range(w):
+            pass
+
+    t1 = time.time()
+    return t1 - t0
+
+
+def run_static_alpha_parallel(alpha):
+    """
+    Contiguous split:
+      - FPGA: rows [0, row_fpga)
+      - CPU : rows [row_fpga, M)
+    Run CPU and FPGA in parallel threads.
+    Returns: (total_time, max_err, fpga_time, cpu_time)
+    """
+    row_fpga      = int(alpha * M)
+    row_cpu_start = row_fpga
+    row_cpu_end   = M
+
+    C_buf[:] = 0.0
+    C_buf.flush()
+    C_cpu[:] = 0.0
+    C_combined[:] = 0.0
+
+    fpga_time = 0.0
+    cpu_time  = 0.0
+
+    def fpga_worker():
+        nonlocal fpga_time
+        if row_fpga > 0:
+            fpga_time = fpga_gemm_partial(0, row_fpga)
+
+    def cpu_worker():
+        nonlocal cpu_time
+        if row_cpu_start < row_cpu_end:
+            cpu_time = cpu_gemm_partial_rows(C_cpu, row_cpu_start, row_cpu_end)
+
+    t0 = time.time()
+    threads = []
+    if row_fpga > 0:
+        t_fpga = threading.Thread(target=fpga_worker)
+        threads.append(t_fpga)
+        t_fpga.start()
+    if row_cpu_start < row_cpu_end:
+        t_cpu = threading.Thread(target=cpu_worker)
+        threads.append(t_cpu)
+        t_cpu.start()
+    for t in threads:
+        t.join()
+    t1 = time.time()
+    total_time = t1 - t0
+
+    # Merge results
+    C_fpga_now = np.array(C_buf)
+    if row_fpga > 0:
+        C_combined[0:row_fpga, :] = C_fpga_now[0:row_fpga, :]
+    if row_cpu_start < row_cpu_end:
+        C_combined[row_cpu_start:row_cpu_end, :] = C_cpu[row_cpu_start:row_cpu_end, :]
+
+    max_err = float(np.max(np.abs(C_combined - C_ref)))
+    return total_time, max_err, fpga_time, cpu_time
+
+print("\nStatic alpha sweep with parallel CPU+FPGA:")
+for alpha in np.linspace(0.0, 1.0, 11):
+    t, err, t_fpga, t_cpu = run_static_alpha_parallel(alpha)
+    print(f"  alpha = {alpha:0.1f} -> total = {t:0.4f} s "
+          f"(FPGA ~ {t_fpga:0.4f}, CPU ~ {t_cpu:0.4f}), max_err = {err:0.3e}")
+
+
+def measure_cpu_one_row(row_idx):
+    """Measure CPU time (GEMM + dummy work) for a single row."""
+    C_tmp = np.zeros((M, N), dtype=np.float32)
+    return cpu_gemm_partial_rows(C_tmp, row_idx, row_idx + 1)
+
+def measure_fpga_one_row(row_idx):
+    """Measure FPGA time for a single row (includes work[row_idx])."""
+    C_buf[:] = 0.0
+    C_buf.flush()
+    return fpga_gemm_partial(row_idx, 1)
+
+row_probe = 1  
+t_cpu_row  = measure_cpu_one_row(row_probe)
+t_fpga_row = measure_fpga_one_row(row_probe)
+
+T_cpu_full_est  = M * t_cpu_row
+T_fpga_full_est = M * t_fpga_row
+
+alpha_one = T_cpu_full_est / (T_cpu_full_est + T_fpga_full_est) if (T_cpu_full_est + T_fpga_full_est) > 0 else 0.0
+alpha_one = float(np.clip(alpha_one, 0.0, 1.0))
+row_fpga_one = int(round(alpha_one * M))
+
+print(f"\nDynamic alpha based on ONE-ROW timing (row_idx={row_probe}):")
+print(f"  t_cpu_row  ≈ {t_cpu_row:.6e} s, T_cpu_full_est  ≈ {T_cpu_full_est:.6f} s")
+print(f"  t_fpga_row ≈ {t_fpga_row:.6e} s, T_fpga_full_est ≈ {T_fpga_full_est:.6f} s")
+print(f"  alpha_one ≈ {alpha_one:.3f} -> row_fpga ≈ {row_fpga_one}")
+
+t_one, err_one, t_fpga_one_run, t_cpu_one_run = run_static_alpha_parallel(alpha_one)
+print("Dynamic ONE-ROW alpha run (contiguous split):")
+print(f"  total time = {t_one:.6f} s "
+      f"(FPGA ~ {t_fpga_one_run:.6f}, CPU ~ {t_cpu_one_run:.6f}), "
+      f"max_err = {err_one:.3e}")
+
+
+NUM_SAMPLE_ROWS  = 100
+SAMPLE_ROW_START = 0           
+SAMPLE_ROW_END   = SAMPLE_ROW_START + NUM_SAMPLE_ROWS
+assert SAMPLE_ROW_END <= M
+
+def measure_cpu_sample_rows(row_start, row_end):
+    """
+    Measure CPU time to compute rows [row_start, row_end) (GEMM + dummy work).
+    """
+    C_tmp = np.zeros((M, N), dtype=np.float32)
+    return cpu_gemm_partial_rows(C_tmp, row_start, row_end)
+
+def measure_fpga_sample_rows(row_start, row_end):
+    """
+    Measure FPGA time to compute rows [row_start, row_end) (with work[]).
+    """
+    C_buf[:] = 0.0
+    C_buf.flush()
+    return fpga_gemm_partial(row_start, row_end - row_start)
+
+t_cpu_10  = measure_cpu_sample_rows(SAMPLE_ROW_START, SAMPLE_ROW_END)
+t_fpga_10 = measure_fpga_sample_rows(SAMPLE_ROW_START, SAMPLE_ROW_END)
+
+
+t_cpu_row_10  = t_cpu_10  / NUM_SAMPLE_ROWS
+t_fpga_row_10 = t_fpga_10 / NUM_SAMPLE_ROWS
+
+
+alpha_10 = t_cpu_10 / (t_cpu_10 + t_fpga_10) if (t_cpu_10 + t_fpga_10) > 0 else 0.0
+alpha_10 = float(np.clip(alpha_10, 0.0, 1.0))
+row_fpga_10 = int(round(alpha_10 * M))
+
+print(f"\nDynamic alpha based on FIRST-100-ROWS timing (rows {SAMPLE_ROW_START}..{SAMPLE_ROW_END-1}):")
+print(f"  t_cpu_10rows  ≈ {t_cpu_10:.6e} s  (per row ≈ {t_cpu_row_10:.6e} s)")
+print(f"  t_fpga_10rows ≈ {t_fpga_10:.6e} s  (per row ≈ {t_fpga_row_10:.6e} s)")
+print(f"  alpha_10 ≈ {alpha_10:.3f} -> row_fpga ≈ {row_fpga_10}")
+
+t_10, err_10, t_fpga_10_run, t_cpu_10_run = run_static_alpha_parallel(alpha_10)
+print("Dynamic FIRST-10-ROWS alpha run (contiguous split):")
+print(f"  total time = {t_10:.6f} s "
+      f"(FPGA ~ {t_fpga_10_run:.6f}, CPU ~ {t_cpu_10_run:.6f}), "
+      f"max_err = {err_10:.3e}")
+
+
+def measure_cpu_full_rows():
+    """CPU-only: compute all rows [0:M) using cpu_gemm_partial_rows()."""
+    C_cpu[:] = 0.0
+    return cpu_gemm_partial_rows(C_cpu, 0, M)
+
+def measure_fpga_full_rows():
+    """FPGA-only: compute all rows [0:M) using fpga_gemm_partial()."""
+    return fpga_gemm_partial(0, M)
+
+cpu_full_dyn  = measure_cpu_full_rows()
+fpga_full_dyn = measure_fpga_full_rows()
+
+alpha_star = cpu_full_dyn / (cpu_full_dyn + fpga_full_dyn) if (cpu_full_dyn + fpga_full_dyn) > 0 else 0.0
+alpha_star = float(np.clip(alpha_star, 0.0, 1.0))
+row_fpga_star = int(round(alpha_star * M))
+
+print("\nDynamic alpha* based on FULL-RUN times:")
+print(f"  CPU full rows time  : {cpu_full_dyn:.6f} s")
+print(f"  FPGA full rows time : {fpga_full_dyn:.6f} s")
+print(f"  alpha* (ideal FPGA row fraction) = {alpha_star:.3f}")
+print(f"  => FPGA rows: {row_fpga_star}, CPU rows: {M - row_fpga_star}")
+
+t_star, err_star, t_fpga_star, t_cpu_star = run_static_alpha_parallel(alpha_star)
+print("Dynamic alpha* run (contiguous split):")
+print(f"  total time = {t_star:.6f} s "
+      f"(FPGA ~ {t_fpga_star:.6f}, CPU ~ {t_cpu_star:.6f}), "
+      f"max_err = {err_star:.3e}")
+
+print("\nCompare to full runs:")
+print(f"  CPU full (dyn)  : {cpu_full_dyn:.6f} s")
+print(f"  FPGA full (dyn) : {fpga_full_dyn:.6f} s")
+
+
+def taskpool_dynamic(block_rows):
+    """
+    Task-pool dynamic scheme:
+      - Split rows [0:M) into blocks of 'block_rows'.
+      - CPU and FPGA both pull blocks from a shared queue.
+    Returns: (total_time, max_err, fpga_time_total, cpu_time_total)
+    """
+    tasks = [(i, min(i + block_rows, M)) for i in range(0, M, block_rows)]
+
+    rng = np.random.default_rng(0)
+    rng.shuffle(tasks)
+
+    task_lock = threading.Lock()
+    owner = np.zeros(M, dtype=np.int8)  # 0=none, 1=CPU, 2=FPGA
+
+    C_buf[:] = 0.0
+    C_buf.flush()
+    C_cpu[:] = 0.0
+    C_combined[:] = 0.0
+
+    fpga_time_total = 0.0
+    cpu_time_total  = 0.0
+
+    def get_task():
+        nonlocal tasks
+        with task_lock:
+            if not tasks:
+                return None
+            return tasks.pop()
+
+    def fpga_worker():
+        nonlocal fpga_time_total
+        while True:
+            task = get_task()
+            if task is None:
+                break
+            rs, re = task
+            fpga_time_total += fpga_gemm_partial(rs, re - rs)
+            owner[rs:re] = 2
+
+    def cpu_worker():
+        nonlocal cpu_time_total
+        while True:
+            task = get_task()
+            if task is None:
+                break
+            rs, re = task
+            cpu_time_total += cpu_gemm_partial_rows(C_cpu, rs, re)
+            owner[rs:re] = 1
+
+    t0 = time.time()
+    t_fpga = threading.Thread(target=fpga_worker)
+    t_cpu  = threading.Thread(target=cpu_worker)
+    t_fpga.start()
+    t_cpu.start()
+    t_fpga.join()
+    t_cpu.join()
+    t1 = time.time()
+    total_time = t1 - t0
+
+    C_fpga_now = np.array(C_buf)
+    for i in range(M):
+        if owner[i] == 2:
+            C_combined[i, :] = C_fpga_now[i, :]
+        elif owner[i] == 1:
+            C_combined[i, :] = C_cpu[i, :]
+        else:
+            C_combined[i, :] = 0.0
+
+    max_err = float(np.max(np.abs(C_combined - C_ref)))
+    return total_time, max_err, fpga_time_total, cpu_time_total
+
+print("\n=== Task-pool dynamic scheduling ===")
+for br in [8, 16, 32, 64]:
+    t_pool, err_pool, t_fpga_pool, t_cpu_pool = taskpool_dynamic(br)
+    print(f"  block_rows= {br:2d} -> total={t_pool:.4f}s, "
+          f"FPGA={t_fpga_pool:.4f}s, CPU={t_cpu_pool:.4f}s, "
+          f"max_err={err_pool:.3e}")
